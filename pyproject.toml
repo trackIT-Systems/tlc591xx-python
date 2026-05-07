@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tlc591xx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python library for the TLC59108 and TLC59116 constant-current LED sink driver"
 readme = "README.md"
 license = { file = "LICENSE" }

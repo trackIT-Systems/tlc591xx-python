@@ -9,7 +9,7 @@ from typing import Union
 
 from smbus2 import SMBus
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -35,7 +35,7 @@ __all__ = [
     "LEDOUT_BLINK",
     "LEDOUT_MASK",
     "MODE1_NORMAL",
-    "MODE1_SPEED",
+    "MODE1_SLEEP",
     "MODE2_DIM",
     "MODE2_BLINK",
     "MODE2_OCH_STOP",
@@ -43,7 +43,7 @@ __all__ = [
     "AUTO_INCREMENT",
 ]
 
-# --- Register addresses (MODE / PWM / LEDOUT are shared layout; see chip-specific below) ---
+# --- Register addresses (MODE / PWM shared; chip-specific below) ---
 
 REG_MODE1 = 0x00
 REG_MODE2 = 0x01
@@ -54,16 +54,16 @@ REG_GRPFREQ = 0x13
 REG_IREF = 0x1C
 REG_EFLAG1 = 0x1D
 REG_EFLAG2 = 0x1E
-# TLC59108 only (SLDS156) — map is compact; do not use 59116 GRPPWM/EFLAG addresses on 59108
+# TLC59108 only (SLDS156) — map is compact; do not use 59116 addresses on 59108
 REG59108_GRPPWM = 0x0A
 REG59108_GRPFREQ = 0x0B
 REG59108_IREF = 0x12
 REG59108_EFLAG = 0x13
 
-# MODE1: bit 4 = OSC (0 = normal / oscillator on for PWM); bit 0 = ALLCALL response
+# MODE1: bit 4 = OSC (1 = oscillator off / low-power sleep); bit 0 = ALLCALL response
 MODE1_NORMAL = 0 << 4
-MODE1_SPEED = 1 << 4
-MODE1_ALLCALL = 0x01  # respond to All Call I2C address
+MODE1_SLEEP = 1 << 4   # oscillator off → low-power sleep; outputs off
+MODE1_ALLCALL = 0x01   # respond to All Call I²C address
 
 # MODE2: bit 5 = DMBLNK (0 = group dim, 1 = group blink); bit 3 = OCH
 MODE2_DIM = 0 << 5
@@ -75,11 +75,14 @@ MODE2_OCH_ACK = 1 << 3
 LEDOUT_OFF = 0x0
 LEDOUT_ON = 0x1
 LEDOUT_DIM = 0x2
-LEDOUT_BLINK = 0x3
+LEDOUT_BLINK = 0x3   # participates in group generator (dim or blink depending on MODE2)
 LEDOUT_MASK = 0x3
 
-# I2C register auto-increment (datasheet: set bit 7 of command byte)
+# I²C register auto-increment (set bit 7 of command byte)
 AUTO_INCREMENT = 0x80
+
+# GRPFREQ: period = (GRPFREQ + 1) / 24 seconds  →  range ≈ 41.7 ms – 10.67 s
+_GRPFREQ_HZ = 24.0
 
 _MAX_REGISTER_59116 = 0x1E
 _MAX_REGISTER_59108 = REG59108_EFLAG
@@ -104,6 +107,9 @@ class TLC591xx:
         ledout_offset: int,
         max_register: int,
         eflag_registers: tuple[int, ...],
+        grppwm_reg: int,
+        grpfreq_reg: int,
+        iref_reg: int,
     ) -> None:
         if not (0 <= address <= 0x7F):
             raise ValueError(f"invalid I2C address: {address!r}")
@@ -124,6 +130,9 @@ class TLC591xx:
         self._ledout_count = (num_leds + 3) // 4
         self._max_register = max_register
         self._eflag_registers = eflag_registers
+        self._reg_grppwm = grppwm_reg
+        self._reg_grpfreq = grpfreq_reg
+        self._reg_iref = iref_reg
 
         if self._ledout_offset + self._ledout_count - 1 > max_register:
             raise ValueError("LEDOUT registers would exceed max register address")
@@ -136,7 +145,7 @@ class TLC591xx:
             self._own_bus = False
 
         # Same intent as Linux leds-tlc591xx: normal mode, group dim, outputs latch on STOP.
-        # MODE1: oscillator on (OSC=0), respond to All Call (plan / typical bring-up).
+        # MODE1: oscillator on (OSC=0), respond to All Call (typical bring-up).
         self._write(REG_MODE1, MODE1_NORMAL | MODE1_ALLCALL)
         self._write(REG_MODE2, MODE2_OCH_STOP | MODE2_DIM)
 
@@ -159,6 +168,10 @@ class TLC591xx:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    # ------------------------------------------------------------------
+    # Low-level register access
+    # ------------------------------------------------------------------
+
     def _write(self, reg: int, value: int) -> None:
         if not (0 <= reg <= self._max_register):
             raise ValueError(f"register out of range: {reg}")
@@ -172,6 +185,14 @@ class TLC591xx:
     def read_register(self, reg: int) -> int:
         """Read an 8-bit register (e.g. for diagnostics or hardware tests)."""
         return self._read(reg)
+
+    def write_register(self, reg: int, value: int) -> None:
+        """Write an 8-bit value to any register (escape hatch for advanced use)."""
+        self._write(reg, value & 0xFF)
+
+    # ------------------------------------------------------------------
+    # Channel helpers
+    # ------------------------------------------------------------------
 
     def _check_channel(self, channel: int) -> None:
         if not (0 <= channel < self._num_leds):
@@ -187,6 +208,10 @@ class TLC591xx:
         cur = self._read(reg)
         cur = (cur & ~mask) | ((state & LEDOUT_MASK) << shift)
         self._write(reg, cur)
+
+    # ------------------------------------------------------------------
+    # Brightness control
+    # ------------------------------------------------------------------
 
     def set_brightness(self, channel: int, value: int) -> None:
         """Set one channel: 0 off, 255 on (full), 1–254 PWM duty."""
@@ -235,6 +260,142 @@ class TLC591xx:
         cmd = AUTO_INCREMENT | REG_PWM0
         self._bus.write_i2c_block_data(self._address, cmd, pwm_bytes)
 
+    # ------------------------------------------------------------------
+    # Group generator: hardware blink and group dim
+    # ------------------------------------------------------------------
+
+    def set_group_blink(
+        self,
+        period: float,
+        duty: float = 0.5,
+        channels: list[int] | None = None,
+    ) -> None:
+        """
+        Enable hardware group-blink on selected channels.
+
+        The chip's internal oscillator drives the blink autonomously — no CPU
+        polling is needed once configured.  Individual per-channel PWM values
+        (set via :py:meth:`set_brightness`) determine brightness during the ON
+        phase; make sure to call ``set_brightness(ch, value)`` with ``value``
+        in 1–254 *before* this method so that PWM registers hold meaningful values.
+
+        :param period:   Blink period in seconds.  Hardware range ≈ 0.042–10.67 s;
+                         values outside this range are clamped.
+        :param duty:     On-time fraction 0.0–1.0 (default 0.5 = 50 %).
+        :param channels: Channel indices to blink.  ``None`` = all channels.
+        """
+        if period <= 0:
+            raise ValueError("period must be > 0")
+        if not (0.0 <= duty <= 1.0):
+            raise ValueError("duty must be 0.0..1.0")
+
+        grpfreq = max(0, min(255, round(period * _GRPFREQ_HZ - 1)))
+        grppwm = max(0, min(255, round(duty * 256)))
+
+        self._write(self._reg_grppwm, grppwm)
+        self._write(self._reg_grpfreq, grpfreq)
+
+        cur = self._read(REG_MODE2)
+        self._write(REG_MODE2, (cur & ~MODE2_BLINK) | MODE2_BLINK)
+
+        chs = channels if channels is not None else range(self._num_leds)
+        for ch in chs:
+            self._set_ledout(ch, LEDOUT_BLINK)
+
+    def set_group_dim(
+        self,
+        level: float,
+        channels: list[int] | None = None,
+    ) -> None:
+        """
+        Apply a hardware master-brightness multiplier (group dim) to selected channels.
+
+        Channels opted in (LEDOUT = ``LEDOUT_BLINK`` in dim mode) have their
+        individual PWM output further scaled by ``level``.  This lets you dim
+        a whole group of LEDs with a single register write rather than updating
+        every PWM channel.
+
+        :param level:    Brightness multiplier 0.0 (off) – 1.0 (no additional dimming).
+        :param channels: Channel indices to include.  ``None`` = all channels.
+        """
+        if not (0.0 <= level <= 1.0):
+            raise ValueError("level must be 0.0..1.0")
+
+        grppwm = max(0, min(255, round(level * 255)))
+        self._write(self._reg_grppwm, grppwm)
+
+        cur = self._read(REG_MODE2)
+        self._write(REG_MODE2, cur & ~MODE2_BLINK)  # clear DMBLNK → group dim
+
+        chs = channels if channels is not None else range(self._num_leds)
+        for ch in chs:
+            self._set_ledout(ch, LEDOUT_BLINK)
+
+    # ------------------------------------------------------------------
+    # Current reference
+    # ------------------------------------------------------------------
+
+    def set_iref(self, value: int) -> None:
+        """
+        Set the output current reference register (raw 8-bit value).
+
+        Bit 7 (HC): when set, halves the full-scale output current.
+        Bits 6:0 (CC): 7-bit current-control word — see the datasheet for the
+        full formula relating CC, the external resistor (REXT), and Iout_fs.
+
+        :param value: Raw byte to write to the IREF register (0–255).
+        """
+        if not (0 <= value <= 255):
+            raise ValueError("iref value must be 0..255")
+        self._write(self._reg_iref, value)
+
+    # ------------------------------------------------------------------
+    # Power management
+    # ------------------------------------------------------------------
+
+    def sleep(self) -> None:
+        """
+        Put the chip into low-power sleep mode (oscillator off, all outputs off).
+
+        Call :py:meth:`wake` to resume normal operation.
+        """
+        cur = self._read(REG_MODE1)
+        self._write(REG_MODE1, cur | MODE1_SLEEP)
+
+    def wake(self) -> None:
+        """
+        Wake the chip from sleep mode (oscillator on).
+
+        The datasheet recommends a 500 µs delay after waking before driving
+        outputs to let the oscillator stabilise.
+        """
+        cur = self._read(REG_MODE1)
+        self._write(REG_MODE1, cur & ~MODE1_SLEEP)
+
+    # ------------------------------------------------------------------
+    # Output-change timing
+    # ------------------------------------------------------------------
+
+    def set_output_change_on_ack(self, enable: bool) -> None:
+        """
+        Control when output registers take effect.
+
+        :param enable: ``True`` — outputs update on each I²C ACK (OCH = 1).
+                       ``False`` — outputs update on I²C STOP condition (default, OCH = 0).
+
+        ACK mode can reduce visible tearing when updating many channels in a
+        block write; STOP mode (default) is safer for most use cases.
+        """
+        cur = self._read(REG_MODE2)
+        if enable:
+            self._write(REG_MODE2, cur | MODE2_OCH_ACK)
+        else:
+            self._write(REG_MODE2, cur & ~MODE2_OCH_ACK)
+
+    # ------------------------------------------------------------------
+    # Error flags
+    # ------------------------------------------------------------------
+
     def read_errors(self) -> tuple[int, int]:
         """
         Return error-flag bytes as ``(first, second)``.
@@ -262,6 +423,9 @@ class TLC59116(TLC591xx):
             ledout_offset=0x14,
             max_register=_MAX_REGISTER_59116,
             eflag_registers=(REG_EFLAG1, REG_EFLAG2),
+            grppwm_reg=REG_GRPPWM,
+            grpfreq_reg=REG_GRPFREQ,
+            iref_reg=REG_IREF,
         )
 
 
@@ -276,4 +440,7 @@ class TLC59108(TLC591xx):
             ledout_offset=0x0C,
             max_register=_MAX_REGISTER_59108,
             eflag_registers=(REG59108_EFLAG,),
+            grppwm_reg=REG59108_GRPPWM,
+            grpfreq_reg=REG59108_GRPFREQ,
+            iref_reg=REG59108_IREF,
         )
