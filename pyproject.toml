@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "tlc591xx"
@@ -9,6 +9,9 @@ description = "Python library for the TLC59108 and TLC59116 constant-current LED
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
+dependencies = [
+    "smbus2>=0.4",
+]
 authors = [
     { name = "Jonas Höchst", email = "hoechst@trackit.systems" },
 ]
@@ -25,5 +28,17 @@ Homepage = "https://github.com/trackIT-Systems/tlc591xx-python"
 Repository = "https://github.com/trackIT-Systems/tlc591xx-python"
 Issues = "https://github.com/trackIT-Systems/tlc591xx-python/issues"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "hardware: requires a TLC591xx on I2C; set TLC591XX_I2C_BUS (and optional TLC591XX_ADDRESS, TLC591XX_MODEL)",
+]
